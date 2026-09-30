@@ -1,20 +1,38 @@
-import time
+import os, time, jwt, httpx
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from passlib.context import CryptContext
-import jwt
 
-app = FastAPI(title="Auth Service")
+INSTANCE_NAME = os.getenv("INSTANCE_NAME", "auth-service-1")
+SERVICE_PORT = int(os.getenv("PORT", "8000"))
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Регистрация при старте
+    async with httpx.AsyncClient() as client:
+        try:
+            payload = {"Name": "auth-service", "ID": INSTANCE_NAME, "Address": "auth", "Port": SERVICE_PORT}
+            await client.put("http://consul:8500/v1/agent/service/register", json=payload, timeout=3.0)
+        except Exception:
+            pass # Если упадет, Docker-compose позволит приложению работать
+            
+    yield
+    
+    # Дерегистрация при выключении
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.put(f"http://consul:8500/v1/agent/service/deregister/{INSTANCE_NAME}", timeout=3.0)
+        except Exception:
+            pass
+
+app = FastAPI(title="Auth Service", lifespan=lifespan)
 users_db = {}
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-JWT_SECRET = "super_secret_key_change_me_in_production"
-JWT_ALGORITHM = "HS256"
-
 security_bearer = HTTPBearer()
+
+JWT_SECRET, JWT_ALGORITHM = "super_secret_key", "HS256"
 
 class UserAuth(BaseModel):
     username: str
@@ -23,51 +41,23 @@ class UserAuth(BaseModel):
 @app.post("/register", status_code=status.HTTP_201_CREATED)
 def register(user: UserAuth):
     if user.username in users_db:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Пользователь с таким именем уже существует"
-        )
+        raise HTTPException(status_code=400, detail="Пользователь уже существует")
     users_db[user.username] = pwd_context.hash(user.password)
-    return {"message": f"Пользователь {user.username} успешно зарегистрирован"}
-
+    return {"message": "Успешная регистрация"}
 
 @app.post("/login")
 def login(user: UserAuth):
-    hashed_password = users_db.get(user.username)
-    if not hashed_password or not pwd_context.verify(user.password, hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Неверное имя пользователя или пароль"
-        )
+    hashed = users_db.get(user.username)
+    if not hashed or not pwd_context.verify(user.password, hashed):
+        raise HTTPException(status_code=401, detail="Неверный логин или пароль")
     
-    payload = {
-        "sub": user.username,
-        "exp": time.time() + 3600
-    }
-    
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    token = jwt.encode({"sub": user.username, "exp": time.time() + 3600}, JWT_SECRET, algorithm=JWT_ALGORITHM)
     return {"access_token": token, "token_type": "bearer"}
 
 @app.get("/me")
 def get_me(credentials: HTTPAuthorizationCredentials = Depends(security_bearer)):
-    token = credentials.credentials
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, 
-                detail="Невалидный токен"
-            )
-        return {"username": username, "status": "active"}
-    
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, 
-            detail="Срок действия токена истек"
-        )
-    except jwt.PyJWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, 
-            detail="Невалидный токен или подпись изменены"
-        )
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return {"username": payload.get("sub"), "status": "active"}
+    except (jwt.ExpiredSignatureError, jwt.PyJWTError):
+        raise HTTPException(status_code=401, detail="Невалидный токен")
