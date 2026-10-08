@@ -41,15 +41,15 @@ class UserAuth(BaseModel):
 @app.post("/register", status_code=status.HTTP_201_CREATED)
 def register(user: UserAuth):
     if user.username in users_db:
-        raise HTTPException(status_code=400, detail="Пользователь уже существует")
+        raise HTTPException(status_code=400, detail="User already exists")
     users_db[user.username] = pwd_context.hash(user.password)
-    return {"message": "Успешная регистрация"}
+    return {"message": "User registered successfully"}
 
 @app.post("/login")
 def login(user: UserAuth):
     hashed = users_db.get(user.username)
     if not hashed or not pwd_context.verify(user.password, hashed):
-        raise HTTPException(status_code=401, detail="Неверный логин или пароль")
+        raise HTTPException(status_code=401, detail="Invalid username or password")
     
     token = jwt.encode({"sub": user.username, "exp": time.time() + 3600}, JWT_SECRET, algorithm=JWT_ALGORITHM)
     return {"access_token": token, "token_type": "bearer"}
@@ -60,4 +60,4 @@ def get_me(credentials: HTTPAuthorizationCredentials = Depends(security_bearer))
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         return {"username": payload.get("sub"), "status": "active"}
     except (jwt.ExpiredSignatureError, jwt.PyJWTError):
-        raise HTTPException(status_code=401, detail="Невалидный токен")
+        raise HTTPException(status_code=401, detail="Invalid token")

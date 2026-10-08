@@ -15,8 +15,8 @@ CONSUL_DEREGISTER_URL = f"http://consul:8500/v1/agent/service/deregister/{INSTAN
 
 # 2. In-memory хранилище для товаров (простой словарь Python)
 products_db = {
-    1: {"id": 1, "name": "Ноутбук", "price": 75000},
-    2: {"id": 2, "name": "Мышь беспроводная", "price": 2500}
+    1: {"id": 1, "name": "Laptop", "price": 75000},
+    2: {"id": 2, "name": "Wireless mouse", "price": 2500}
 }
 id_counter = 3
 
@@ -89,7 +89,7 @@ async def create_product(product: Product):
 async def update_product(id: int, updated_product: Product):
     """Обновить существующий товар."""
     if id not in products_db:
-        raise HTTPException(status_code=404, detail="Товар не найден")
+        raise HTTPException(status_code=404, detail="Product not found")
     
     products_db[id].update({
         "name": updated_product.name,
@@ -101,7 +101,7 @@ async def update_product(id: int, updated_product: Product):
 async def delete_product(id: int):
     """Удалить товар."""
     if id not in products_db:
-        raise HTTPException(status_code=404, detail="Товар не найден")
+        raise HTTPException(status_code=404, detail="Product not found")
     
     deleted_product = products_db.pop(id)
-    return {"message": "Товар успешно удален", "product": deleted_product}
+    return {"message": "Product deleted successfully", "product": deleted_product}
