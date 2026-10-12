@@ -52,6 +52,20 @@ services:
       - consul
     networks:
       - micro_network
+  
+  # Микросервис Заказов 
+  order-service:
+    build:
+      context: ./order_service
+      dockerfile: Dockerfile
+    container_name: order-service
+    environment:
+      - INSTANCE_NAME=order-service-1
+      - PORT=8000
+    depends_on:
+      - consul
+    networks:
+      - micro_network
 
   # Шлюз API Gateway и балансировщик (Nginx)
   nginx:
@@ -65,8 +79,11 @@ services:
       - auth
       - catalog-1
       - catalog-2
+      - order-service
     networks:
       - micro_network
+
+
 
 networks:
   micro_network:
