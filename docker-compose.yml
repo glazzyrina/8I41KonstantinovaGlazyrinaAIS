@@ -52,6 +52,20 @@ services:
       - consul
     networks:
       - micro_network
+  # Ваш новый GraphQL Шлюз
+  graphql-gateway:
+    build:
+      context: ./graphql_gateway
+      dockerfile: Dockerfile
+    container_name: graphql-gateway
+    depends_on:
+      - consul
+      - order-service
+      - catalog-1
+      - catalog-2
+    networks:
+      - micro_network
+
 
   # Шлюз API Gateway и балансировщик (Nginx)
   nginx:
@@ -65,6 +79,8 @@ services:
       - auth
       - catalog-1
       - catalog-2
+      - order-service
+      - graphql-gateway # Добавили зависимость от вашего шлюза
     networks:
       - micro_network
 
