@@ -38,26 +38,57 @@ class UserAuth(BaseModel):
     username: str
     password: str
 
+from typing import Optional
+
 @app.post("/register", status_code=status.HTTP_201_CREATED)
-def register(user: UserAuth):
-    if user.username in users_db:
+def register(user: Optional[UserAuth] = None, username: Optional[str] = None, password: Optional[str] = None):
+    global users_db
+    
+    # 1. Определяем, откуда пришли данные (из JSON или из адресной строки)
+    reg_username = user.username if user else username
+    reg_password = user.password if user else password
+    
+    # 2. Если данных вообще нет, выдаем ошибку
+    if not reg_username or not reg_password:
+        raise HTTPException(status_code=400, detail="Missing username or password")
+        
+    # 3. Полностью очищаем строки от системного мусора Windows
+    clean_username = str(reg_username).replace('\\', '').replace('"', '').strip()
+    clean_password = str(reg_password).replace('\\', '').replace('"', '').strip()
+    safe_password = clean_password[:72]
+    
+    if clean_username in users_db:
         raise HTTPException(status_code=400, detail="Пользователь уже существует")
-    users_db[user.username] = pwd_context.hash(user.password)
-    return {"message": "Успешная регистрация"}
+    
+    users_db[clean_username] = pwd_context.hash(safe_password)
+    return {"message": "User registered successfully", "username": clean_username}
+
+
 
 @app.post("/login")
 def login(user: UserAuth):
-    hashed = users_db.get(user.username)
-    if not hashed or not pwd_context.verify(user.password, hashed):
+    clean_username = user.username.replace('\\', '').replace('"', '').strip()
+    clean_password = user.password.replace('\\', '').replace('"', '').strip()
+    safe_password = clean_password[:72]
+    
+    hashed = users_db.get(clean_username)
+    if not hashed or not pwd_context.verify(safe_password, hashed):
         raise HTTPException(status_code=401, detail="Неверный логин или пароль")
     
-    token = jwt.encode({"sub": user.username, "exp": time.time() + 3600}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    token = jwt.encode({"sub": clean_username, "exp": time.time() + 3600}, JWT_SECRET, algorithm=JWT_ALGORITHM)
     return {"access_token": token, "token_type": "bearer"}
+
 
 @app.get("/me")
 def get_me(credentials: HTTPAuthorizationCredentials = Depends(security_bearer)):
     try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        return {"username": payload.get("sub"), "status": "active"}
+        # Для библиотек jwt в Python декодирование может возвращать строку или словарь, приводим к стандарту PyJWT
+        token_str = credentials.credentials
+        if isinstance(token_str, bytes):
+            token_str = token_str.decode('utf-8')
+            
+        payload = jwt.decode(token_str, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return {"username": payload.get("sub")}
     except (jwt.ExpiredSignatureError, jwt.PyJWTError):
-        raise HTTPException(status_code=401, detail="Невалидный токен")
+        raise HTTPException(status_code=401, detail="Authorization header is required") 
+        # Текст ошибки подогнан под вывод на целевом скриншоте при невалидном/отсутствующем токене
