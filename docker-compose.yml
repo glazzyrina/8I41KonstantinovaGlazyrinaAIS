@@ -52,6 +52,21 @@ services:
       - consul
     networks:
       - micro_network
+
+  # Микросервис Заказов (ВОССТАНОВЛЕН)
+  order-service:
+    build:
+      context: ./order_service
+      dockerfile: Dockerfile
+    container_name: order-service
+    environment:
+      - INSTANCE_NAME=order-service-1
+      - PORT=8000
+    depends_on:
+      - consul
+    networks:
+      - micro_network
+
   # Ваш новый GraphQL Шлюз
   graphql-gateway:
     build:
@@ -66,7 +81,6 @@ services:
     networks:
       - micro_network
 
-
   # Шлюз API Gateway и балансировщик (Nginx)
   nginx:
     image: nginx:alpine
@@ -80,7 +94,7 @@ services:
       - catalog-1
       - catalog-2
       - order-service
-      - graphql-gateway # Добавили зависимость от вашего шлюза
+      - graphql-gateway
     networks:
       - micro_network
 

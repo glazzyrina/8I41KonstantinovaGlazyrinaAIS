@@ -38,9 +38,7 @@ async def batch_load_products(product_ids: List[str]) -> List[Any]:
 
 product_loader = DataLoader(load_fn=batch_load_products)
 
-# ==========================================
-# ШАГ 3: GraphQL СХЕМА И ИНТРОСПЕКЦИЯ
-# ==========================================
+
 @strawberry.type(description="Информация о конкретном товаре из каталога")
 class Product:
     id: strawberry.ID = strawberry.field(description="Уникальный идентификатор товара")
@@ -68,9 +66,8 @@ class RawOrderItem:
         self.product_id = product_id
         self.quantity = quantity
 
-# ==========================================
+
 # РЕЗОЛВЕРЫ И АГРЕГАЦИЯ ДАННЫХ
-# ==========================================
 @strawberry.type
 class Query:
     @strawberry.field(description="Получить все заказы конкретного пользователя по его ID")
@@ -106,7 +103,9 @@ class Query:
 
 # Инициализация схемы и роутера
 schema = strawberry.Schema(query=Query)
-graphql_router = GraphQLRouter(schema, graphiql=True)
+graphql_router = GraphQLRouter(schema, graphql_ide="graphiql", path="/")
+
 
 app = FastAPI(title="GraphQL Gateway")
-app.include_router(graphql_router, prefix="/graphql")
+app.include_router(graphql_router, prefix="")
+
