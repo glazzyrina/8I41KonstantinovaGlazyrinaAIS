@@ -27,7 +27,14 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
-app = FastAPI(title="Auth Service", lifespan=lifespan)
+app = FastAPI(
+    title="Auth Service", 
+    version="3.0.0",
+    description="Микросервис управления пользователями и выпуска JWT-токенов с OpenAPI",
+    lifespan=lifespan,
+    docs_url="/api/auth/docs",          # Swagger будет доступен по этому пути
+    openapi_url="/api/auth/openapi.json" # Путь к схеме
+)
 users_db = {}
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security_bearer = HTTPBearer()

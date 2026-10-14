@@ -98,5 +98,9 @@ class Query:
 schema = strawberry.Schema(query=Query)
 graphql_app = GraphQLRouter(schema)
 
-app = FastAPI(title="GraphQL Gateway")
+app = FastAPI(
+    title="Order Service",
+    version="3.0.0",
+    description="Микросервис управления заказами для GraphQL агрегации"
+)
 app.include_router(graphql_app, prefix="/graphql")

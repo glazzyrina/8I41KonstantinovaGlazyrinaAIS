@@ -8,8 +8,8 @@ app = FastAPI(
     title="Order Service",
     version="3.0.0",
     description="Микросервис управления заказами для GraphQL агрегации",
-    docs_url="/api/orders/docs",
-    openapi_url="/api/orders/openapi.json"
+    docs_url="/api/orders/docs",          # Swagger будет доступен по этому пути
+    openapi_url="/api/orders/openapi.json" # Путь к схеме
 )
 
 INSTANCE_NAME = os.getenv("INSTANCE_NAME", "order-default")

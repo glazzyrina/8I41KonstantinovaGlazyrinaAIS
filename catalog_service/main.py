@@ -10,9 +10,10 @@ app = FastAPI(
     title="Catalog Service",
     version="3.0.0",
     description="Микросервис каталога товаров со Swagger UI и пагинацией",
-    docs_url="/api/catalog/docs",
-    openapi_url="/api/catalog/openapi.json"
+    docs_url="/api/catalog/docs",          # Swagger будет доступен по этому пути
+    openapi_url="/api/catalog/openapi.json" # Путь к схеме
 )
+
 
 INSTANCE_NAME = os.getenv("INSTANCE_NAME", "catalog-default")
 PORT = int(os.getenv("PORT", "8000"))
