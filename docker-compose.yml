@@ -67,19 +67,20 @@ services:
     networks:
       - micro_network
 
-  # Ваш новый GraphQL Шлюз
+
   graphql-gateway:
     build:
       context: ./graphql_gateway
       dockerfile: Dockerfile
     container_name: graphql-gateway
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
     depends_on:
-      - consul
-      - order-service
       - catalog-1
       - catalog-2
+      - order-service
     networks:
       - micro_network
+
 
   # Шлюз API Gateway и балансировщик (Nginx)
   nginx:
