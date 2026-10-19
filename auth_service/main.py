@@ -98,4 +98,3 @@ def get_me(credentials: HTTPAuthorizationCredentials = Depends(security_bearer))
         return {"username": payload.get("sub")}
     except (jwt.ExpiredSignatureError, jwt.PyJWTError):
         raise HTTPException(status_code=401, detail="Authorization header is required") 
-        # Текст ошибки подогнан под вывод на целевом скриншоте при невалидном/отсутствующем токене

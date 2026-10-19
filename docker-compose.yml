@@ -8,8 +8,7 @@ services:
     ports:
       - "8500:8500"
     command: "agent -dev -client=0.0.0.0"
-    networks:
-      - micro_network
+
 
   # Cервис аутентификации
   auth:
@@ -22,8 +21,7 @@ services:
       - PORT=8000
     depends_on:
       - consul
-    networks:
-      - micro_network
+
 
   # Первый инстанс каталога товаров
   catalog-1:
@@ -36,8 +34,7 @@ services:
       - PORT=8000
     depends_on:
       - consul
-    networks:
-      - micro_network
+
 
   # Второй инстанс каталога товаров
   catalog-2:
@@ -50,10 +47,9 @@ services:
       - PORT=8000
     depends_on:
       - consul
-    networks:
-      - micro_network
 
-  # Микросервис Заказов (ВОССТАНОВЛЕН)
+
+  # Микросервис Заказов 
   order-service:
     build:
       context: ./order_service
@@ -63,9 +59,26 @@ services:
       - INSTANCE_NAME=order-service-1
       - PORT=8000
     depends_on:
-      - consul
-    networks:
-      - micro_network
+      - rabbitmq
+
+
+  payment-service:
+    build: ./payment_service
+    container_name: payment-service
+    environment:
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - rabbitmq
+
+
+  notification-service:
+    build: ./notification_service
+    container_name: notification-service
+    environment:
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - rabbitmq
+
 
 
   graphql-gateway:
@@ -78,8 +91,7 @@ services:
       - catalog-1
       - catalog-2
       - order-service
-    networks:
-      - micro_network
+
 
 
   # Шлюз API Gateway и балансировщик (Nginx)
@@ -96,9 +108,20 @@ services:
       - catalog-2
       - order-service
       - graphql-gateway
-    networks:
-      - micro_network
 
-networks:
-  micro_network:
-    driver: bridge
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"      # Порт для подключения микросервисов (клиентов)
+      - "15672:15672"    # Порт для веб-панели управления (Management UI)
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+
+volumes:
+  rabbitmq_data:
