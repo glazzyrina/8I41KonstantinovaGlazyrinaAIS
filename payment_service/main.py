@@ -1,98 +1,57 @@
-import json
 import time
 import random
-import pika
-from fastapi import FastAPI
+from concurrent import futures
+import grpc
 
-app = FastAPI(title="Payment Service")
+# Импортируем сгенерированные компилятором gRPC файлы
+import payment_pb2
+import payment_pb2_grpc
 
-def process_order_event(ch, method, properties, body):
-    """Коллбэк-функция: срабатывает автоматически при появлении нового заказа в очереди."""
-    try:
-        # Читаем JSON-данные из сообщения от Order Service
-        order = json.loads(body)
-        order_id = order.get("id")
-        total_amount = order.get("totalAmount", 0.0)
-        
-        print(f"[Payment Service] Получено событие OrderCreated для заказа: {order_id}", flush=True)
-        
-        # Имитируем небольшую временную задержку процессинга банка
-        time.sleep(1.0)
-        
-        # Детерминированная проверка ошибки по методичке для демонстрации компенсации
-        if total_amount < 0:
-            success = False
-            reason = "Отрицательная сумма заказа недопустима"
-        else:
-            # Имитируем случайную проверку оплаты (70% — успех, 30% — ошибка)
-            success = random.random() < 0.7
-            reason = "Недостаточно средств на карте покупателя" if not success else ""
+class PaymentServiceServicer(payment_pb2_grpc.PaymentServiceServicer):
+    """Класс-обработчик входящих gRPC-запросов на проверку оплаты."""
 
-        # Настраиваем подключение к RabbitMQ для отправки ответа обратно в Order Service
-        connection = pika.BlockingConnection(pika.ConnectionParameters(host='rabbitmq'))
-        channel = connection.channel()
+    def CheckPaymentStatus(self, request, context):
+        print(f"[gRPC Payment Server] Получен запрос для Заказа {request.order_id} на сумму {request.amount}", flush=True)
+
+        # Детерминированная симуляция падения по флагу для удобства защиты
+        if request.simulate_failure:
+            print(f"[gRPC Payment Server] Имитация критического сбоя по запросу клиента!", flush=True)
+            context.set_code(grpc.StatusCode.UNAVAILABLE)
+            context.set_details("Платежный шлюз временно недоступен (UNAVAILABLE)")
+            return payment_pb2.PaymentResponse()
+
+        # Рандомный сбой с вероятностью 30% по требованиям методички
+        if random.random() < 0.3:
+            print(f"[gRPC Payment Server] Технический сбой эквайринга (30% вероятность)", flush=True)
+            context.set_code(grpc.StatusCode.UNAVAILABLE)
+            context.set_details("Внутренняя ошибка банка. Попробуйте позже.")
+            return payment_pb2.PaymentResponse()
+
+        # Успешный сценарий проведения оплаты
+        tx_id = f"grpc-tx-{int(time.time())}"
+        print(f"[gRPC Payment Server] Оплата успешно проведена. ID транзакции: {tx_id}", flush=True)
         
-        if success:
-            # Сценарий успеха: публикуем событие в очередь payment_completed_queue
-            reply_queue = 'payment_completed_queue'
-            payload = json.dumps({
-                "orderId": order_id, 
-                "transactionId": f"tx-{int(time.time())}"
-            })
-            print(f"[Payment Service] Оплата ОДОБРЕНА для заказа {order_id}. Отправляем PaymentCompleted.", flush=True)
-        else:
-            # Сценарий ошибки: публикуем событие в очередь payment_failed_queue
-            reply_queue = 'payment_failed_queue'
-            payload = json.dumps({
-                "orderId": order_id, 
-                "reason": reason
-            })
-            print(f"[Payment Service] Оплата ОТКЛОНЕНА для заказа {order_id} ({reason}). Отправляем PaymentFailed.", flush=True)
-            
-        # Декларируем целевую очередь ответов и отправляем персистентное сообщение
-        channel.queue_declare(queue=reply_queue, durable=True)
-        channel.basic_publish(
-            exchange='',
-            routing_key=reply_queue,
-            body=payload,
-            properties=pika.BasicProperties(delivery_mode=2)
+        return payment_pb2.PaymentResponse(
+            transaction_id=tx_id,
+            status="SUCCESS",
+            message="Платеж успешно одобрен и проведен."
         )
-        connection.close()
-        
-        # Подтверждаем RabbitMQ, что сообщение успешно обработано и его можно удалить из очереди
-        ch.basic_ack(delivery_tag=method.delivery_tag)
-        
-    except Exception as e:
-        print(f"[Payment Service] Критическая ошибка обработки сообщения: {e}", flush=True)
 
-def start_rabbitmq_consumer():
-    """Бесконечный цикл прослушивания входящих событий от брокера сообщений с авто-переподключением."""
-    # Ждём 5 секунд при самом первом старте, чтобы дать RabbitMQ время открыть порты
-    time.sleep(5.0)
+def serve():
+    """Запуск gRPC сервера на порту 50051."""
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    payment_pb2_grpc.add_PaymentServiceServicer_to_server(PaymentServiceServicer(), server)
     
-    while True:
-        try:
-            connection = pika.BlockingConnection(pika.ConnectionParameters(host='rabbitmq', heartbeat=600))
-            channel = connection.channel()
-            
-            # Гарантируем создание очереди, которую мы будем слушать
-            channel.queue_declare(queue='order_created_queue', durable=True)
-            
-            # Распределяем входящие сообщения поштучно
-            channel.basic_qos(prefetch_count=1)
-            
-            # Подписываем нашу функцию на очередь создания заказов
-            channel.basic_consume(queue='order_created_queue', on_message_callback=process_order_event)
-            
-            print("[Payment Service] Успешно подключен к RabbitMQ. Ожидание событий OrderCreated...", flush=True)
-            channel.start_consuming()
-        except Exception as e:
-            print(f"[Payment Service] Брокер недоступен, повторное подключение через 5 секунд... ({e})", flush=True)
-            time.sleep(5.0)
+    # Слушаем порт 50051 (стандартный для gRPC внутренних вызовов микросервисов)
+    server.add_insecure_port('[::]:50051')
+    print("[gRPC Payment Server] Сервер оплаты запущен на порту 50051 и ожидает gRPC вызовов...", flush=True)
+    
+    server.start()
+    try:
+        while True:
+            time.sleep(86400) # Держим процесс запущенным
+    except KeyboardInterrupt:
+        server.stop(0)
 
-# Фоновый запуск прослушивания брокера при старте контейнера FastAPI
-@app.on_event("startup")
-async def startup_event():
-    import threading
-    threading.Thread(target=start_rabbitmq_consumer, daemon=True).start()
-
+if __name__ == '__main__':
+    serve()

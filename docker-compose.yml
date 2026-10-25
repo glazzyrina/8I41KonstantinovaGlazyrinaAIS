@@ -67,8 +67,7 @@ services:
     container_name: payment-service
     environment:
       - PYTHONUNBUFFERED=1
-    depends_on:
-      - rabbitmq
+
 
 
   notification-service:

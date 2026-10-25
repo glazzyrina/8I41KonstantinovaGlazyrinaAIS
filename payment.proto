@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package payment;
+
+// Описание gRPC-сервиса оплаты
+service PaymentService {
+  // Метод проверки и проведения платежа
+  rpc CheckPaymentStatus (PaymentRequest) returns (PaymentResponse);
+}
+
+// Структура входящего запроса от Order Service
+message PaymentRequest {
+  string order_id = 1;
+  double amount = 2;
+  bool simulate_failure = 3; // Флаг для контролируемой симуляции сбоя на защите
+}
+
+// Структура ответного сообщения от Payment Service
+message PaymentResponse {
+  string transaction_id = 1;
+  string status = 2;         // SUCCESS, FAILED, PROCESSING
+  string message = 3;        // Текстовое описание результата
+}
