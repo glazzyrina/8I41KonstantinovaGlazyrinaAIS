@@ -8,7 +8,8 @@ services:
     ports:
       - "8500:8500"
     command: "agent -dev -client=0.0.0.0"
-
+    networks:
+      - main_network
 
   # Cервис аутентификации
   auth:
@@ -21,7 +22,8 @@ services:
       - PORT=8000
     depends_on:
       - consul
-
+    networks:
+      - main_network
 
   # Первый инстанс каталога товаров
   catalog-1:
@@ -34,7 +36,8 @@ services:
       - PORT=8000
     depends_on:
       - consul
-
+    networks:
+      - main_network
 
   # Второй инстанс каталога товаров
   catalog-2:
@@ -47,28 +50,34 @@ services:
       - PORT=8000
     depends_on:
       - consul
+    networks:
+      - main_network
 
-
-  # Микросервис Заказов 
+  # Микросервис Заказов (Write Side + Read Side CQRS)
   order-service:
     build:
       context: ./order_service
       dockerfile: Dockerfile
     container_name: order-service
+    ports:
+      - "8081:8000"
     environment:
       - INSTANCE_NAME=order-service-1
       - PORT=8000
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
     depends_on:
       - rabbitmq
-
+      - kafka
+    networks:
+      - main_network
 
   payment-service:
     build: ./payment_service
     container_name: payment-service
     environment:
       - PYTHONUNBUFFERED=1
-
-
+    networks:
+      - main_network
 
   notification-service:
     build: ./notification_service
@@ -77,8 +86,68 @@ services:
       - PYTHONUNBUFFERED=1
     depends_on:
       - rabbitmq
+    networks:
+      - main_network
+
+  # Служба координации для классической Кафки
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - main_network
+
+  # Брокер сообщений Apache Kafka (Классический стабильный режим)
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    depends_on:
+      - zookeeper
+    networks:
+      - main_network
+
+  # Панель управления Kafka UI
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8088:8080"  
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:29092
+    depends_on:
+      - kafka
+    networks:
+      - main_network
 
 
+  # Cервис аналитики 
+  analytics_service:
+    build:
+      context: ./analytics_service
+      dockerfile: Dockerfile
+    container_name: analytics_service
+    ports:
+      - "8006:8000"
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+    depends_on:
+      - kafka
+    networks:
+      - main_network
 
   graphql-gateway:
     build:
@@ -90,8 +159,8 @@ services:
       - catalog-1
       - catalog-2
       - order-service
-
-
+    networks:
+      - main_network
 
   # Шлюз API Gateway и балансировщик (Nginx)
   nginx:
@@ -107,20 +176,28 @@ services:
       - catalog-2
       - order-service
       - graphql-gateway
-
+    networks:
+      - main_network
 
   rabbitmq:
     image: rabbitmq:3-management
     container_name: rabbitmq
     ports:
-      - "5672:5672"      # Порт для подключения микросервисов (клиентов)
-      - "15672:15672"    # Порт для веб-панели управления (Management UI)
+      - "5672:5672"
+      - "15672:15672"
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - main_network
 
-
+# СЕКЦИЯ ОБЪЯВЛЕНИЯ ТОМОВ
 volumes:
   rabbitmq_data:
+
+# СЕКЦИЯ ОБЪЯВЛЕНИЯ СЕТЕЙ (ЖЕСТКО ЗАДАЕТ ОБЩУЮ СЕТЬ)
+networks:
+  main_network:
+    driver: bridge

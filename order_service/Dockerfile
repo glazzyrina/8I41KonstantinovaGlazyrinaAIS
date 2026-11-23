@@ -4,7 +4,7 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-# Принудительная установка gRPC и предохранителя для ЛР5
+# Принудительная установка gRPC и предохранителя
 RUN pip install --no-cache-dir grpcio>=1.65.0 grpcio-tools>=1.65.0 pybreaker==1.0.1
 
 COPY . .

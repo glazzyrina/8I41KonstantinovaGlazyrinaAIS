@@ -20,7 +20,7 @@ class PaymentServiceServicer(payment_pb2_grpc.PaymentServiceServicer):
             context.set_details("Платежный шлюз временно недоступен (UNAVAILABLE)")
             return payment_pb2.PaymentResponse()
 
-        # Рандомный сбой с вероятностью 30% по требованиям методички
+        # Рандомный сбой с вероятностью 30%
         if random.random() < 0.3:
             print(f"[gRPC Payment Server] Технический сбой эквайринга (30% вероятность)", flush=True)
             context.set_code(grpc.StatusCode.UNAVAILABLE)
@@ -42,7 +42,7 @@ def serve():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     payment_pb2_grpc.add_PaymentServiceServicer_to_server(PaymentServiceServicer(), server)
     
-    # Слушаем порт 50051 (стандартный для gRPC внутренних вызовов микросервисов)
+    # Слушаем порт 50051
     server.add_insecure_port('[::]:50051')
     print("[gRPC Payment Server] Сервер оплаты запущен на порту 50051 и ожидает gRPC вызовов...", flush=True)
     

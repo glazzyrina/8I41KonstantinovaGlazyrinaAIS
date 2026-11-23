@@ -1,139 +1,243 @@
+import uuid
+import json
+import asyncio
 import os
-import time
-import grpc
-import pybreaker
-from fastapi import FastAPI, Query, HTTPException
-from pydantic import BaseModel
-from typing import List
+from datetime import datetime, timezone
+from typing import Dict, List, Any, Optional
+from contextlib import asynccontextmanager
+from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, status
+from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 
-# Импортируем сгенерированные компилятором gRPC файлы
-import payment_pb2
-import payment_pb2_grpc
+# Конфигурация подключения к Kafka
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
+KAFKA_TOPIC = "orders-events"
 
-app = FastAPI(
-    title="Order Service",
-    version="5.0.0",
-    description="Микросервис управления заказами с интеграцией gRPC и Circuit Breaker",
-    docs_url="/api/orders/docs",
-    openapi_url="/api/orders/openapi.json"
-)
-
-# In-memory БД: заказы пользователей ( userId -> список заказов )
-orders_db = {
-    "123": [
-        {
-            "id": "order-101",
-            "userId": "123",
-            "createdAt": "2026-10-12T12:00:00Z",
-            "status": "SUCCESS",
-            "totalAmount": 1500.0,
-            "items": [{"product_id": 1, "quantity": 1}]
-        }
-    ]
-}
-
-# НАСТРОЙКА CIRCUIT BREAKER
-class LogCircuitBreakerListener(pybreaker.CircuitBreakerListener):
-    """Слушатель событий предохранителя для наглядного вывода смены состояний в логи."""
-    def state_change(self, cb, old_state, new_state):
-        print(f"\n[CIRCUIT BREAKER] >>> СМЕНА СОСТОЯНИЯ: {old_state.name} -> {new_state.name} <<<\n", flush=True)
-
-# Инициализируем предохранитель по требованиям методички:
-db_breaker = pybreaker.CircuitBreaker(
-    fail_max=3,                  # Порог ошибок: после 3 неудач подряд цепь размыкается (OPEN)
-    reset_timeout=10.0,          # Время нахождения в OPEN перед переходом в HALF-OPEN
-    listeners=[LogCircuitBreakerListener()]
-)
-
-# --- СХЕМЫ ВАЛИДАЦИИ PYDANTIC ---
-class OrderItemCreate(BaseModel):
-    product_id: int
-    quantity: int
-
-class OrderCreate(BaseModel):
-    userId: str
-    items: List[OrderItemCreate]
-    totalAmount: float
-    simulate_failure: bool = False # Флаг для контролируемой симуляции ошибки
+producer: Optional[AIOKafkaProducer] = None
 
 
-# FALLBACK ФУНКЦИЯ
-def payment_fallback(order_id: str, reason: str):
-    """Возвращает осмысленный локальный ответ-заглушку, когда платежная система недоступна."""
-    print(f"[Fallback] Вызвана резервная логика для заказа {order_id}. Причина: {reason}", flush=True)
-    return {
-        "id": order_id,
-        "status": "PROCESSING",
-        "message": "Платёжная система временно недоступна. Платёж переведён в фоновую обработку."
-    }
+
+# РЕАЛИЗАЦИЯ EVENT STORE (ХРАНИЛИЩЕ СОБЫТИЙ)
+
+class Event(BaseModel):
+    event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    order_id: str
+    event_type: str
+    payload: Dict[str, Any]
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    version: int
+
+class EventStore:
+    def __init__(self):
+        self._storage: Dict[str, List[Event]] = {}
+
+    def save_event(self, order_id: str, event_type: str, payload: Dict[str, Any]) -> Event:
+        if order_id not in self._storage:
+            self._storage[order_id] = []
+        current_version = len(self._storage[order_id])
+        next_version = current_version + 1
+        new_event = Event(order_id=order_id, event_type=event_type, payload=payload, version=next_version)
+        self._storage[order_id].append(new_event)
+        return new_event
+
+    def get_events(self, order_id: str) -> List[Event]:
+        return self._storage.get(order_id, [])
+
+event_store = EventStore()
 
 
-# REST API ЭНДПОИНТЫ
 
-@app.get("/api/orders")
-async def get_orders_by_user(userId: str = Query(..., description="ID пользователя")):
-    return orders_db.get(userId, [])
+# РЕАЛИЗАЦИЯ REHYDRATION (ВОССТАНОВЛЕНИЕ СОСТОЯНИЯ)
 
-@app.post("/api/orders")
-async def create_order(order_data: OrderCreate):
-    """Создание заказа и вызов gRPC сервиса оплаты через Circuit Breaker."""
-    order_id = f"order-{int(time.time())}"
-    
-    # Формируем структуру нового заказа со стартовым статусом PENDING
-    new_order = {
-        "id": order_id,
-        "userId": order_data.userId,
-        "createdAt": "2026-10-12T10:00:00Z",
-        "status": "PENDING",
-        "totalAmount": order_data.totalAmount,
-        "items": [{"product_id": item.product_id, "quantity": item.quantity} for item in order_data.items]
-    }
-    
-    # Вызываем gRPC-метод оплаты через Circuit Breaker
+class OrderAggregate:
+    def __init__(self, order_id: str):
+        self.order_id = order_id
+        self.status = None
+        self.total_amount = 0.0
+        self.items = []
+
+    def apply(self, event: Event):
+        if event.event_type == "OrderCreated":
+            self.status = "CREATED"
+            self.total_amount = event.payload.get("total_amount", 0.0)
+            self.items = event.payload.get("items", [])
+        elif event.event_type == "OrderPaid":
+            self.status = "PAID"
+        elif event.event_type == "OrderCancelled":
+            self.status = "CANCELLED"
+
+def rehydrate_order(order_id: str) -> OrderAggregate:
+    events = event_store.get_events(order_id)
+    aggregate = OrderAggregate(order_id)
+    for event in events:
+        aggregate.apply(event)
+    return aggregate
+
+
+
+# READ SIDE (ЗАПРОСЫ — CQRS)
+
+class OrderReadModel(BaseModel):
+    order_id: str
+    status: str
+    total_amount: float
+    items: List[Dict[str, Any]]
+    updated_at: str
+
+class ReadModelStorage:
+    def __init__(self):
+        self._storage: Dict[str, OrderReadModel] = {}
+
+    def get_by_id(self, order_id: str) -> Optional[OrderReadModel]:
+        return self._storage.get(order_id)
+
+    def update_projection(self, event_dict: Dict[str, Any]):
+        order_id = event_dict["order_id"]
+        event_type = event_dict["event_type"]
+        payload = event_dict["payload"]
+        timestamp = event_dict["timestamp"]
+
+        if event_type == "OrderCreated":
+            self._storage[order_id] = OrderReadModel(
+                order_id=order_id, status="CREATED",
+                total_amount=payload.get("total_amount", 0.0),
+                items=payload.get("items", []), updated_at=timestamp
+            )
+        elif event_type == "OrderPaid":
+            if order_id in self._storage:
+                self._storage[order_id].status = "PAID"
+                self._storage[order_id].updated_at = timestamp
+        elif event_type == "OrderCancelled":
+            if order_id in self._storage:
+                self._storage[order_id].status = "CANCELLED"
+                self._storage[order_id].updated_at = timestamp
+
+read_model_storage = ReadModelStorage()
+
+
+# ФОНОВЫЙ ПОДПИСЧИК KAFKA (CONSUMER)
+
+async def kafka_consumer_worker():
+    consumer = None
+    while True:
+        try:
+            consumer = AIOKafkaConsumer(
+                KAFKA_TOPIC,
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                group_id="order-service-read-group",
+                auto_offset_reset="earliest"
+            )
+            await consumer.start()
+            print("Successfully connected Consumer to Kafka")
+            break
+        except Exception as e:
+            print(f"Consumer waiting for Kafka network... ({e})")
+            if consumer:
+                await consumer.stop()
+            await asyncio.sleep(5)
+
     try:
-        # Вызов функции, обёрнутой в предохранитель
-        @db_breaker
-        def call_grpc_payment():
-            # Устанавливаем gRPC-канал с контейнером payment-service на порту 50051
-            with grpc.insecure_channel('payment-service:50051') as channel:
-                stub = payment_pb2_grpc.PaymentServiceStub(channel)
-                
-                # Формируем gRPC Request по контракту .proto файла
-                request = payment_pb2.PaymentRequest(
-                    order_id=order_id,
-                    amount=order_data.totalAmount,
-                    simulate_failure=order_data.simulate_failure
-                )
-                
-                # Делаем синхронный вызов с таймаутом в 3 секунды по ТЗ
-                response = stub.CheckPaymentStatus(request, timeout=3.0)
-                return response
+        async for message in consumer:
+            event_data = json.loads(message.value.decode('utf-8'))
+            read_model_storage.update_projection(event_data)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if consumer:
+            await consumer.stop()
 
-        # Запускаем выполнение gRPC вызова
-        grpc_response = call_grpc_payment()
-        
-        # Если вызов прошёл успешно, обновляем статус в нашей in-memory БД
-        new_order["status"] = grpc_response.status
-        new_order["message"] = grpc_response.message
-        
-    except pybreaker.CircuitBreakerError:
-        # Сценарий OPEN: Цепь разомкнута. Запрос даже не пошёл в сеть, сразу включаем Fallback!
-        fallback_res = payment_fallback(order_id, "Circuit Breaker находится в состоянии OPEN")
-        new_order["status"] = fallback_res["status"]
-        new_order["message"] = fallback_res["message"]
-        
-    except grpc.RpcError as e:
-        # Сценарий CLOSED/HALF-OPEN: Сетевая ошибка gRPC (например, статус UNAVAILABLE)
-        print(f"[gRPC Client Error] Зафиксирован сетевой сбой: {e.details()}", flush=True)
-        
-        # Включаем локальный Fallback, чтобы клиент не упал со статус-кодом 500
-        fallback_res = payment_fallback(order_id, f"gRPC сбой: {e.details()}")
-        new_order["status"] = fallback_res["status"]
-        new_order["message"] = fallback_res["message"]
 
-    # Сохраняем итоговый статус заказа в базу данных
-    if order_data.userId not in orders_db:
-        orders_db[order_data.userId] = []
-    orders_db[order_data.userId].append(new_order)
+
+# LIFESPAN (ИНИЦИАЛИЗАЦИЯ И ЗАВЕРШЕНИЕ)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global producer
+    while True:
+        try:
+            producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
+            await producer.start()
+            print("Successfully connected Producer to Kafka")
+            break
+        except Exception as e:
+            print(f"Producer waiting for Kafka network... ({e})")
+            await asyncio.sleep(5)
     
-    return new_order
+    consumer_task = asyncio.create_task(kafka_consumer_worker())
+    yield
+    if producer:
+        await producer.stop()
+    consumer_task.cancel()
+
+app = FastAPI(title="Order Service (CQRS/ES)", lifespan=lifespan)
+
+
+# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ПУБЛИКАЦИИ
+
+async def send_to_kafka(event: Event):
+    if producer:
+        event_json = event.json()
+        await producer.send_and_wait(KAFKA_TOPIC, event_json.encode('utf-8'))
+
+
+# WRITE SIDE С ПОЛНОЙ ПРОВЕРКОЙ БИЗНЕС-ПРАВИЛ
+
+class CreateOrderRequest(BaseModel):
+    items: List[Dict[str, Any]]
+    total_amount: float
+
+@app.post("/orders", status_code=status.HTTP_201_CREATED)
+async def create_order(request: CreateOrderRequest):
+    order_id = str(uuid.uuid4())
+    payload = {"items": request.items, "total_amount": request.total_amount}
+    event = event_store.save_event(order_id, "OrderCreated", payload)
+    await send_to_kafka(event)
+    return {"message": "Order creation commanded", "order_id": order_id, "event": event}
+
+@app.post("/orders/{order_id}/pay")
+async def pay_order(order_id: str):
+    # Восстановление состояния через Rehydration перед проверкой правил
+    aggregate = rehydrate_order(order_id)
+    if aggregate.status is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    
+    # БИЗНЕС-ПРАВИЛА ОПЛАТЫ
+    if aggregate.status == "PAID":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order is already paid")
+    if aggregate.status == "CANCELLED":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot pay for a cancelled order")
+    
+    event = event_store.save_event(order_id, "OrderPaid", {})
+    await send_to_kafka(event)
+    return {"message": "Order payment commanded", "order_id": order_id, "event": event}
+
+@app.post("/orders/{order_id}/cancel")
+async def cancel_order(order_id: str):
+    # Восстановление состояния через Rehydration перед проверкой правил
+    aggregate = rehydrate_order(order_id)
+    if aggregate.status is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    
+    # БИЗНЕС-ПРАВИЛА ОТМЕНЫ
+    if aggregate.status == "CANCELLED":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order is already cancelled")
+    if aggregate.status == "PAID":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot cancel an already paid order")
+    
+    event = event_store.save_event(order_id, "OrderCancelled", {})
+    await send_to_kafka(event)
+    return {"message": "Order cancellation commanded", "order_id": order_id, "event": event}
+
+@app.get("/orders/{order_id}", response_model=OrderReadModel)
+async def get_order(order_id: str):
+    order_data = read_model_storage.get_by_id(order_id)
+    if not order_data:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found in Read Model (yet)")
+    return order_data
+
+@app.get("/orders/{order_id}/events")
+async def get_order_events(order_id: str):
+    events = event_store.get_events(order_id)
+    if not events:
+        raise HTTPException(status_code=404, detail="No events found for this order")
+    return events
