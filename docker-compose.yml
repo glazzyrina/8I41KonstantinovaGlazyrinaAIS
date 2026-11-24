@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  # Реестр Consul (Service Discovery)
+  # Реестр Consul
   consul:
     image: hashicorp/consul:latest
     container_name: consul
@@ -11,7 +11,7 @@ services:
     networks:
       - main_network
 
-  # Cервис аутентификации
+  # Сервис аутентификации (JWT + bcrypt)
   auth:
     build:
       context: ./auth_service
@@ -20,6 +20,7 @@ services:
     environment:
       - INSTANCE_NAME=auth-service-1
       - PORT=8000
+      - JWT_SECRET=super-secret-jwt-key-from-env-2026
     depends_on:
       - consul
     networks:
@@ -53,7 +54,7 @@ services:
     networks:
       - main_network
 
-  # Микросервис Заказов (Write Side + Read Side CQRS)
+  # Микросервис заказов
   order-service:
     build:
       context: ./order_service
@@ -68,6 +69,24 @@ services:
     depends_on:
       - rabbitmq
       - kafka
+    networks:
+      - main_network
+
+  # Центральный API Gateway (JWT validation + Rate Limiting)
+  api-gateway:
+    build:
+      context: ./api_gateway
+      dockerfile: Dockerfile
+    container_name: api-gateway
+    ports:
+      - "8085:8000"
+    environment:
+      - JWT_SECRET=super-secret-jwt-key-from-env-2026
+    depends_on:
+      - auth
+      - catalog-1
+      - catalog-2
+      - order-service
     networks:
       - main_network
 
@@ -89,7 +108,6 @@ services:
     networks:
       - main_network
 
-  # Служба координации для классической Кафки
   zookeeper:
     image: confluentinc/cp-zookeeper:7.3.0
     container_name: zookeeper
@@ -99,7 +117,6 @@ services:
     networks:
       - main_network
 
-  # Брокер сообщений Apache Kafka (Классический стабильный режим)
   kafka:
     image: confluentinc/cp-kafka:7.3.0
     container_name: kafka
@@ -119,12 +136,11 @@ services:
     networks:
       - main_network
 
-  # Панель управления Kafka UI
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
     ports:
-      - "8088:8080"  
+      - "8088:8080"
     environment:
       - KAFKA_CLUSTERS_0_NAME=local
       - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:29092
@@ -133,8 +149,6 @@ services:
     networks:
       - main_network
 
-
-  # Cервис аналитики 
   analytics_service:
     build:
       context: ./analytics_service
@@ -162,7 +176,7 @@ services:
     networks:
       - main_network
 
-  # Шлюз API Gateway и балансировщик (Nginx)
+  # Внешний входной балансировщик (Nginx -> API Gateway)
   nginx:
     image: nginx:alpine
     container_name: nginx
@@ -171,11 +185,7 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      - auth
-      - catalog-1
-      - catalog-2
-      - order-service
-      - graphql-gateway
+      - api-gateway
     networks:
       - main_network
 
@@ -193,11 +203,9 @@ services:
     networks:
       - main_network
 
-# СЕКЦИЯ ОБЪЯВЛЕНИЯ ТОМОВ
 volumes:
   rabbitmq_data:
 
-# СЕКЦИЯ ОБЪЯВЛЕНИЯ СЕТЕЙ (ЖЕСТКО ЗАДАЕТ ОБЩУЮ СЕТЬ)
 networks:
   main_network:
     driver: bridge

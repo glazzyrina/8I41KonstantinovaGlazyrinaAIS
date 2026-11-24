@@ -6,18 +6,31 @@ from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Header, Depends
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 
-# Конфигурация подключения к Kafka
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
 KAFKA_TOPIC = "orders-events"
 
 producer: Optional[AIOKafkaProducer] = None
 
 
+# ПРОВЕРКА РОЛИ (RBAC) ОТ API GATEWAY
 
-# РЕАЛИЗАЦИЯ EVENT STORE (ХРАНИЛИЩЕ СОБЫТИЙ)
+def require_authorized_role(
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id")
+):
+    """Разрешает доступ для любой авторизованной роли (user или admin)."""
+    if x_user_role not in ("user", "admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: создание и управление заказами доступно только ролям user или admin"
+        )
+    return {"user_id": x_user_id, "role": x_user_role}
+
+
+# EVENT STORE & REHYDRATION
 
 class Event(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -34,8 +47,7 @@ class EventStore:
     def save_event(self, order_id: str, event_type: str, payload: Dict[str, Any]) -> Event:
         if order_id not in self._storage:
             self._storage[order_id] = []
-        current_version = len(self._storage[order_id])
-        next_version = current_version + 1
+        next_version = len(self._storage[order_id]) + 1
         new_event = Event(order_id=order_id, event_type=event_type, payload=payload, version=next_version)
         self._storage[order_id].append(new_event)
         return new_event
@@ -44,10 +56,6 @@ class EventStore:
         return self._storage.get(order_id, [])
 
 event_store = EventStore()
-
-
-
-# РЕАЛИЗАЦИЯ REHYDRATION (ВОССТАНОВЛЕНИЕ СОСТОЯНИЯ)
 
 class OrderAggregate:
     def __init__(self, order_id: str):
@@ -74,8 +82,7 @@ def rehydrate_order(order_id: str) -> OrderAggregate:
     return aggregate
 
 
-
-# READ SIDE (ЗАПРОСЫ — CQRS)
+# READ SIDE (CQRS)
 
 class OrderReadModel(BaseModel):
     order_id: str
@@ -114,9 +121,6 @@ class ReadModelStorage:
 
 read_model_storage = ReadModelStorage()
 
-
-# ФОНОВЫЙ ПОДПИСЧИК KAFKA (CONSUMER)
-
 async def kafka_consumer_worker():
     consumer = None
     while True:
@@ -128,10 +132,8 @@ async def kafka_consumer_worker():
                 auto_offset_reset="earliest"
             )
             await consumer.start()
-            print("Successfully connected Consumer to Kafka")
             break
-        except Exception as e:
-            print(f"Consumer waiting for Kafka network... ({e})")
+        except Exception:
             if consumer:
                 await consumer.stop()
             await asyncio.sleep(5)
@@ -146,10 +148,6 @@ async def kafka_consumer_worker():
         if consumer:
             await consumer.stop()
 
-
-
-# LIFESPAN (ИНИЦИАЛИЗАЦИЯ И ЗАВЕРШЕНИЕ)
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global producer
@@ -157,10 +155,8 @@ async def lifespan(app: FastAPI):
         try:
             producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
             await producer.start()
-            print("Successfully connected Producer to Kafka")
             break
-        except Exception as e:
-            print(f"Producer waiting for Kafka network... ({e})")
+        except Exception:
             await asyncio.sleep(5)
     
     consumer_task = asyncio.create_task(kafka_consumer_worker())
@@ -169,75 +165,63 @@ async def lifespan(app: FastAPI):
         await producer.stop()
     consumer_task.cancel()
 
-app = FastAPI(title="Order Service (CQRS/ES)", lifespan=lifespan)
-
-
-# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ПУБЛИКАЦИИ
+app = FastAPI(title="Order Service (CQRS/ES + RBAC)", lifespan=lifespan)
 
 async def send_to_kafka(event: Event):
     if producer:
-        event_json = event.json()
-        await producer.send_and_wait(KAFKA_TOPIC, event_json.encode('utf-8'))
+        await producer.send_and_wait(KAFKA_TOPIC, event.json().encode('utf-8'))
 
 
-# WRITE SIDE С ПОЛНОЙ ПРОВЕРКОЙ БИЗНЕС-ПРАВИЛ
+# ЭНДПОИНТЫ ЗАКАЗОВ С ПРОВЕРКОЙ RBAC
 
 class CreateOrderRequest(BaseModel):
     items: List[Dict[str, Any]]
     total_amount: float
 
 @app.post("/orders", status_code=status.HTTP_201_CREATED)
-async def create_order(request: CreateOrderRequest):
+async def create_order(
+    request: CreateOrderRequest,
+    user_info: dict = Depends(require_authorized_role)
+):
     order_id = str(uuid.uuid4())
-    payload = {"items": request.items, "total_amount": request.total_amount}
+    payload = {
+        "items": request.items,
+        "total_amount": request.total_amount,
+        "created_by": user_info["user_id"]
+    }
     event = event_store.save_event(order_id, "OrderCreated", payload)
     await send_to_kafka(event)
     return {"message": "Order creation commanded", "order_id": order_id, "event": event}
 
 @app.post("/orders/{order_id}/pay")
-async def pay_order(order_id: str):
-    # Восстановление состояния через Rehydration перед проверкой правил
+async def pay_order(order_id: str, user_info: dict = Depends(require_authorized_role)):
     aggregate = rehydrate_order(order_id)
     if aggregate.status is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    
-    # БИЗНЕС-ПРАВИЛА ОПЛАТЫ
     if aggregate.status == "PAID":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order is already paid")
     if aggregate.status == "CANCELLED":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot pay for a cancelled order")
-    
     event = event_store.save_event(order_id, "OrderPaid", {})
     await send_to_kafka(event)
     return {"message": "Order payment commanded", "order_id": order_id, "event": event}
 
 @app.post("/orders/{order_id}/cancel")
-async def cancel_order(order_id: str):
-    # Восстановление состояния через Rehydration перед проверкой правил
+async def cancel_order(order_id: str, user_info: dict = Depends(require_authorized_role)):
     aggregate = rehydrate_order(order_id)
     if aggregate.status is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    
-    # БИЗНЕС-ПРАВИЛА ОТМЕНЫ
     if aggregate.status == "CANCELLED":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order is already cancelled")
     if aggregate.status == "PAID":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot cancel an already paid order")
-    
     event = event_store.save_event(order_id, "OrderCancelled", {})
     await send_to_kafka(event)
     return {"message": "Order cancellation commanded", "order_id": order_id, "event": event}
 
 @app.get("/orders/{order_id}", response_model=OrderReadModel)
-async def get_order(order_id: str):
+async def get_order(order_id: str, user_info: dict = Depends(require_authorized_role)):
     order_data = read_model_storage.get_by_id(order_id)
     if not order_data:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found in Read Model (yet)")
     return order_data
-
-@app.get("/orders/{order_id}/events")
-async def get_order_events(order_id: str):
-    events = event_store.get_events(order_id)
-    if not events:
-        raise HTTPException(status_code=404, detail="No events found for this order")
-    return events
